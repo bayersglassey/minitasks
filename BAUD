@@ -1,0 +1,5 @@
+# Used by get_baud.sh. Uncomment a single baud value.
+38400
+#19200
+#9600
+#4800

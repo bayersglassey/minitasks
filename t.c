@@ -6,8 +6,8 @@
 
 #include <avr/io.h>
 #include <util/delay.h>
+#include <avr/interrupt.h>
 
-#define F_CPU 16000000L
 
 uint16_t flip(uint16_t x) { return ~x; }
 
@@ -40,4 +40,11 @@ void toggle_led(void) {
     PORTB ^= (1 << PB5);
 }
 
-void main() {}
+ISR (TIMER0_COMPA_vect, ISR_NAKED) {
+    static int x = 0;
+    x++;
+}
+
+int main() {
+    return 0;
+}

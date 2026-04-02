@@ -7,16 +7,18 @@ import termios
 from typing import Tuple
 
 
-DEFAULT_BAUD = 38400
-
 BAUDS = {int(k[1:]): getattr(termios, k)
     for k in dir(termios) if k[0] == 'B' and k[1:].isdigit()}
 
 # For passing NULL pointers to ioctl
-UINT_ZERO = struct.pack('I', 0)
+NULL = struct.pack('I', 0)
 
 
-def get_default_filename() -> str:
+def get_baud() -> int:
+    return next(int(line) for line in open('BAUD') if not line.startswith('#'))
+
+
+def get_tty() -> str:
     for i in range(5):
         filename = f'/dev/ttyUSB{i}'
         if os.path.exists(filename):
@@ -24,9 +26,11 @@ def get_default_filename() -> str:
     raise Exception("Couldn't find a ttyUSB")
 
 
-def open_serial(filename=None, baud=DEFAULT_BAUD) -> Tuple[str, int]:
+def open_serial(filename=None, baud=None) -> Tuple[str, int]:
     if filename is None:
-        filename = get_default_filename()
+        filename = get_tty()
+    if baud is None:
+        baud = get_baud()
     fd = os.open(filename, os.O_RDWR | os.O_NOCTTY)
     iflag, oflag, cflag, lflag, ispeed, ospeed, cc = termios.tcgetattr(fd)
     ispeed = ospeed = BAUDS[baud]
@@ -41,13 +45,16 @@ def open_serial(filename=None, baud=DEFAULT_BAUD) -> Tuple[str, int]:
 
 class Serial:
 
-    def __init__(self, filename=None, baud=DEFAULT_BAUD):
+    def __init__(self, filename=None, baud=None):
+        if baud is None:
+            baud = get_baud()
         self.filename, self.fd = open_serial(filename, baud)
+        self.baud = baud
 
     @property
     def n_available(self) -> int:
         """Returns the number of bytes available in the read queue"""
-        data = fcntl.ioctl(self.fd, termios.FIONREAD, UINT_ZERO)
+        data = fcntl.ioctl(self.fd, termios.FIONREAD, NULL)
         return struct.unpack('I', data)[0]
 
     def read(self, n=None):

@@ -40,3 +40,7 @@
   task's stack, which is wasteful, since every task needs to keep a bunch of stack
   space clear in case an interrupt needs it!..
   see also the comment in the INTERRUPTS section of minitasks.c
+
+* look at I2C... can we connect the 2 Arduinos together?..
+
+* look at "sleep" -- can the main loop go to sleep, and interrupts wake it up?

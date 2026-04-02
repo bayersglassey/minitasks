@@ -464,7 +464,7 @@ that stuff come from?.. in fact, it's from the USART Rx interrupt handler,
 while it was handling our INSPECT_TASK message, and sending us back a dump of
 the task's memory!..
 
-Anyway, let's make sure our program did was it was supposed to, which is to
+Anyway, let's make sure our program did what it was supposed to, which is to
 convert the string literal to uppercase:
 
     In [77]: task.heap.print('c')
@@ -613,11 +613,28 @@ The minitasks OS doesn't do any input/output buffering, so it needs to handle
 each individual character of I/O as quickly as possible!..
 The ATmega 328p's CPU runs at 16MHz on the default clock, i.e. one cycle
 takes 1/16,000,000 seconds.
+So, how many cycles can we do between characters?
+
+    16M cycles = 1 second = 38400 characters
+
+    16M/38400 cycles = 1/38400 second = 1 characters
+
+...and 16M/38400 is around 416. That's how many cycles we can get away with
+executing between USART operations?..
+
 The cycle counts for AVR instructions are given here:
 https://ww1.microchip.com/downloads/en/DeviceDoc/AVR-Instruction-Set-Manual-DS40002198A.pdf
 Looking at various tasklang instruction assembly routines, it looks like they
 generally take about 16 cycles.
-So tasklang instructions can be executed at a rate of about 1MHz.
+So, we can execute about 416/16 = 26 tasklang instructions between USART
+operations?..
+
+Anyway, we need to set up our clock in terms of cycles, I believe.
+The ATmeta 328p has a clock pre-scaler, allowing us to fire interrupts
+every 1, 8, 64, 256, or 1024 cycles.
+Let's have it fire every 256, which gives us a chance to handle USART
+characters and then run some tasklang code, hopefully without dropping
+characters.
 
 TODO...
 

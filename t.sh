@@ -5,5 +5,6 @@
 #
 set -euo pipefail
 
-avr-gcc -mmcu=atmega328p t.c -Os
+./_compile.sh t.c
+
 avr-objdump -d a.out

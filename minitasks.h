@@ -1,23 +1,17 @@
 #ifndef _MINITASKS_H_
 #define _MINITASKS_H_
 
-// I'm using an Elegoo Nano V3.0, which is a knockoff of an Arduino Nano.
-// I found this F_CPU value by seeing what the Arduino IDE used when compiling
-// for the Nano.
-#define F_CPU 16000000L
-
-// I'm not yet sure what constitutes a "good" baud value.
-// Presumably higher is always better, if you can get away with it, i.e. both
-// sides of the communication support it without data corruption?..
-#define BAUD 38400
-
 #include <stdlib.h>
 #include <stddef.h>
+
 #include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/pgmspace.h>
+#include <avr/sleep.h>
+
 #include <util/setbaud.h>
 #include <util/delay.h>
 #include <util/atomic.h> // ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { ... }
-#include <avr/pgmspace.h>
 
 #include "avrstuff.h"
 
@@ -29,6 +23,14 @@
 
 // The size of CODE + HEAP + FREE + STACK
 #define TASK_MEM_SIZE (256 + 128)
+
+// A tick is like a "time slice" for one task; we need to run at least
+// one time slace per task per UART operation, i.e. BAUD.
+// So that every time we read a character from UART, at least one task
+// gets a chance to handle it before the next character, you know?
+#define TICKS_PER_SECOND (BAUD * MAX_TASKS)
+
+#define CYCLES_PER_TICK (F_CPU / TICKS_PER_SECOND)
 
 typedef uint8_t task_id_t;
 
@@ -57,6 +59,7 @@ enum message_type {
     MESSAGE_TASK_STOPPED           = 0x09,
     MESSAGE_GET_MEMORY             = 0x0a,
     MESSAGE_SET_MEMORY             = 0x0b,
+    MESSAGE_GET_TIMER              = 0x0c,
 };
 
 typedef struct task {
@@ -64,6 +67,7 @@ typedef struct task {
     task_state_t state; // enum task_state
     uint16_t code_size;
     char *free; // pointer to FREE
+    char *stack; // pointer to STACK - 1, i.e. last byte of FREE
     char mem[TASK_MEM_SIZE];
 } task_t;
 
@@ -72,11 +76,14 @@ task_t TASKS[MAX_TASKS] = {0};
 // A "builtin" is an assembly routine implementing a tasklang instruction
 typedef void builtin_t(void);
 
-extern const char *death_message;
 void __attribute__((noreturn)) die(const char *msg);
 
-extern __attribute__((noreturn)) void run_task_immediate(char *code,
-    char *free, char *stack);
+void __attribute__((noreturn)) blink_forever(void);
+
+// Functions implemented in tasklang.S
+extern void _init_task(char *code, char *free, char *stack);
+extern void __attribute__((noreturn)) resume_task(char *stack);
+extern void __attribute__((noreturn)) pause_task(void);
 
 // A listing of all tasklang "builtins".
 // NOTE: this list of builtins must be in the same order as that of BUILTINS

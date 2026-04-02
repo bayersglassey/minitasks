@@ -1,0 +1,115 @@
+
+
+
+If TICKS_PER_SECOND is 256, then one tick is 1/256 seconds.
+Let's just use Hz: 256 Hz.
+Our baud is 38,400 Hz.
+Our cycles are 16,000,000 Hz.
+So okay, we *definitely* need more ticks per second than our baud. O_o
+In fact, let's say we want to guarantee a time slice (i.e. tick) for every task
+in between UART operations, i.e. baud.
+So we need TICKS_PER_SECOND to be at least BAUD * MAX_TASKS.
+Currently, MAX_TASKS is 5.
+Let's aim for 8 (if we get the stack size down, e.g. by giving interrupts their
+own stack).
+Then BAUD * MAX_TASKS would be 307,200.
+So, how many cycles is that?..
+
+    1/307,200 s = X cycles
+    1 cycle = 1/16,000,000 s
+    1/307,200 s = X * 1/16,000,000 s
+    X = 1/307,200 * 16,000,000 = 52.083333333
+
+Wow, that's it?.. 52 cycles per time slice...
+And at one point, I estimated 16 cycles per tasklang instruction.
+So 3.25 tasklang instructions per time slice.
+That's... underwhelming. O_o
+And that's not even taking into consideration the overhead from context
+switching!.. which we will need to calculate at some point!..
+
+Now, what might we do to improve the situation?..
+For one thing, what if we loosen this requirement:
+
+    say we want to guarantee a time slice (i.e. tick) for every task
+    in between UART operations
+
+The reason we wanted to do that was so that, if only one task was willing
+to handle a given UART operation, that task would have a chance to "see"
+the operation before another UART operation occurred, blowing away the
+value from the previous operation.
+
+But instead, what if we bring back the UART Rx interrupt?..
+Ehhh what, and have it run the task?! No!.. actually we can bring back the
+UART Rx interrupt, and have it choose a random "waiting for UART" task to
+"wake up" by *changing the task's status*, but then we should still allow
+the timer interrupt to be the thing which actually runs a time slice for each
+task.
+
+Okay, first of all, let's bring back read/write queues.
+
+    #define DEFINE_QUEUE(QUEUE) \
+    task_id_t QUEUE[MAX_TASKS]; \
+    uint8_t QUEUE##_head = 0; \
+    uint8_t QUEUE##_tail = 0;
+
+    #define QUEUE_PUSH(QUEUE, VALUE) { \
+        QUEUE[QUEUE##_tail++] = VALUE; \
+        if (QUEUE##_tail >= MAX_TASKS) QUEUE##_tail = 0; \
+    }
+
+    #define QUEUE_POP(QUEUE, VALUE) { \
+        VALUE = QUEUE[QUEUE##_head++]; \
+        if (QUEUE##_head >= MAX_TASKS) QUEUE##_head = 0; \
+    }
+
+    DEFINE_QUEUE(read_queue)
+    DEFINE_QUEUE(write_queue)
+
+And then... how does sleep work?..
+Well for one thing, we can just use a for-loop.
+Only reason to get fancy now is to like... call the sleep instruction to save power.
+But anyway we don't need a sleep *queue*.
+
+
+OKAY WELL ANYWAY, so we want the timer interrupt to go for like 50 cycles.
+Errrrrm oh but also like... if we can only run 3.25 tasklang instructions per tick,
+then our tasklang code might well drop characters from the UART stream. O_o
+So uhhhhhh well actually, one thing we could do would be to decrease our baud!..
+According to picocom, here are the next lower available baudrates below 38400:
+
+    38400
+    19200
+    9600
+    4800
+
+Those are dividing by 2 each time.
+So we could presumably multiply by powers of 2 the number of tasklang instructions
+we can get in per tick.
+But also, let's make BAUD configurable... we could throw it in a file.
+Or really, what we probably need is to switch to env vars, with a "workon" file
+which sets them up (including looking for the right TTY).
+
+Okay, did that.
+Now, we need to set up TCCR0B to *not* use prescalers, and we need to use the
+"timer output compare interrupt": OCIE0A instead of TOIE0, TIMER0_COMPA_vect
+instead of TIMER0_OVF_vect, and then... set the "compare A" value (OCR0A).
+
+
+
+====================================================================================
+
+
+Cool, the timer interrupt is firing. Now let's figure out context switching.
+Looking at the output of `ack -ho 'r\d\d' tasklang.S | sort -u`, we need to save
+r22 through r31 on the stack.
+So that's 10 registers = 10 PUSH/POP pairs = 20 cycles per context switch.
+Plus switching the stack pointer, RETI, etc.
+Is that it?..
+
+
+
+
+
+
+
+

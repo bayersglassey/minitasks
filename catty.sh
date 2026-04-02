@@ -2,4 +2,4 @@
 set -euo pipefail
 
 ./stty.sh
-cat /dev/ttyUSB0
+cat "$(./get_ttyusb.sh)"

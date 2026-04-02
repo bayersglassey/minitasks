@@ -1,0 +1,42 @@
+
+With tasklang's current threaded code approach, it ends each instruction with:
+
+    rjmp _next
+
+...where:
+
+    _next:
+        ld r30, Y+
+        ld r31, Y+
+        ijmp
+
+Now, would a bytecode approach be more performant?.. we would end each instruction with:
+
+    ret
+
+...which would return us to the main loop, which would be something like:
+
+    _loop:
+        ld r30, Y+
+        ld r31, Y+
+        icall
+        rjmp _loop
+
+...or, for actual bytecodes instead of code pointers,
+
+    _loop:
+        ld r30, Y+ ; load next bytecode
+        add r30, start_of_jump_table_LO
+        addc r31, start_of_jump_table_HI
+        icall
+        rjmp _loop
+
+...so it ends up being the same number of cycles as when using code pointers, I believe.
+
+HMMMMMMMM so it looks like threaded code is probably faster! Because:
+    Threaded code: rjmp + ld + ld + ijmp
+    Bytecode w/ code pointers: ret + ld + ld + icall + rjmp
+...and presumably ret + icall is more expensive than ijmp.
+...and with threaded code, instead of `rjmp _next`, we should really just be using
+a _next macro, and save ourselves an rjmp.
+

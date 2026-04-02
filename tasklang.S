@@ -10,6 +10,20 @@
 builtin_\name:
 .endm
 
+.macro _GET_STACK R0 R1
+    ; load stack pointer into given register pair
+    in \R1, SPH_IO_ADDR
+    in \R0, SPL_IO_ADDR
+.endm
+
+.macro _SET_STACK R0 R1
+    ; set stack pointer to value in given register pair
+    ; NOTE: it seems like we must set SPH before SPL; if we set SPL first, it
+    ; seems that SPH is always set to 0x08. No idea why. O_o
+    out SPH_IO_ADDR, \R1
+    out SPL_IO_ADDR, \R0
+.endm
+
 .macro _BINARYPOP
     ; pop 2 values off the stack, for implementing binary operators.
     ; if stack looks like: x y
@@ -20,33 +34,132 @@ builtin_\name:
     pop r24
 .endm
 
-.global run_task_immediate
-run_task_immediate:
-    ; NOTE: intended to be called by C code, with arguments:
-    ;  code, free, stack
-
-    movw r28, r24 ; load code pointer into Y
-    movw r26, r22 ; load heap pointer into X
-                  ;   ...which points to FREE, i.e. just past top of heap
-
-    ; Set the stack pointer.
-    ; NOTE: it seems like we must set SPH before SPL; if we set SPL first, it
-    ; seems that SPH is always set to 0x08. No idea why. O_o
-    out SPH_IO_ADDR, r21  ; set stack pointer
-    out SPL_IO_ADDR, r20  ; ...
-
-    ; jump to next instruction, i.e. first instruction in task's CODE
-    rjmp _next
-
-_next:
+.macro NEXT
     ; Jump to the next threaded code instruction, and also increment the
     ; threaded code instruction pointer.
     ld r30, Y+   ; load whatever Y is pointing at into Z, and increment Y
     ld r31, Y+   ; ...
     ijmp         ; jump to the code pointed to by Z
+.endm
+
+.macro _SAVE_CONTEXT
+    ; save registers used by tasklang instructions, for context switching
+    push r22
+    push r23
+    push r24
+    push r25
+    push r26 ; X
+    push r27 ; ...
+    push r28 ; Y
+    push r29 ; ...
+    push r30 ; Z
+    push r31 ; ...
+.endm
+
+.macro _LOAD_CONTEXT
+    ; load registers used by tasklang instructions, for context switching
+    pop r31 ; Z
+    pop r30 ; ...
+    pop r29 ; Y
+    pop r28 ; ...
+    pop r27 ; X
+    pop r26 ; ...
+    pop r25
+    pop r24
+    pop r23
+    pop r22
+.endm
+
+.global _init_task
+_init_task:
+    ; NOTE: intended to be called by C code, with arguments:
+    ;  code, free, stack
+
+    ; Save registers which we'll be overwriting in a moment, and must restore
+    ; later in order to return to calling C code
+    ; See: https://gcc.gnu.org/wiki/avr-gcc#Register_Layout
+    push r28
+    push r29
+
+    movw r28, r24 ; load code pointer into Y
+    movw r26, r22 ; load heap pointer into X
+                  ;   ...which points to FREE, i.e. just past top of heap
+
+    ; Save the stack pointer, so we can return to it later
+    _GET_STACK r18 r19
+
+    ; Set the stack pointer to that of the task's to be initialized
+    _SET_STACK r20 r21
+
+    ; Save the "return address" to be used the first time there's a context
+    ; switch to this task
+    ldi r20, lo8(task_start)
+    ldi r21, hi8(task_start)
+    push r20
+    push r21
+
+    ; Save registers, in particular Y and X, to the new stack, to be picked
+    ; up next time there's a context switch to this task
+    _SAVE_CONTEXT
+
+    ; Restore the stack & registers, and return to whoever called us!
+    _SET_STACK r18 r19
+    pop r29
+    pop r28
+    ret
+
+task_start:
+    ; The place tasks first jump to when started
+    NEXT
 
 loop_forever:
     rjmp loop_forever
+
+.global pause_task
+pause_task:
+    ; The timer interrupt, represents a "tick", runs every CYCLES_PER_TICK
+    ; cycles.
+
+    ; Assume we're being called from an interrupt while a task was running.
+    ; So, a return address has been pushed for the task's interrupted code.
+    ; Also, global interrupts are disabled.
+
+    ; save registers
+    _SAVE_CONTEXT
+
+    ; toggle LED
+    ldi r24, lo8(_tick)
+    brne 1f               ; only toggle every 256th tick
+    in	r24, 0x05
+    ldi	r25, 0x20
+    eor	r24, r25
+    out	0x05, r24
+    1:
+
+    ; save stack pointer in first C function argument
+    _GET_STACK r24 r25
+
+    ; save X (i.e. current task's top-of-heap pointer) in second C function argument
+    movw r22, r26
+
+    ; call a C function which switches to next runnable task
+    ; (and never returns to us)
+    ; with arguments:
+    ;   stack, free
+    rjmp switch_task
+
+.global resume_task
+resume_task:
+    ; NOTE: intended to be called by C code, with arguments:
+    ;  stack
+    ; ...but does not return to the calling C code!
+
+    ; Set the stack pointer to that of the task's
+    _SET_STACK r24 r25
+
+    ; load registers & resume from wherever this task left off!..
+    _LOAD_CONTEXT
+    reti
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -68,7 +181,7 @@ BUILTIN add
     push r25
 
     ; jump to the next threaded code instruction
-    rjmp _next
+    NEXT
 
 BUILTIN sub
     ; x y + -> x-y
@@ -78,7 +191,7 @@ BUILTIN sub
     sbc r25, r23 ; ...
     push r24
     push r25
-    rjmp _next
+    NEXT
 
 ; TODO...
 BUILTIN mul
@@ -95,19 +208,13 @@ BUILTIN rshift
 _return_true:
     ; return true from an instruction, i.e. push 1 onto stack and jump to
     ; next instruction
+    ; NOTE: THIS LABEL NEEDS TO LIVE HERE, directly before all the comparison
+    ; operators, in order to be within 64 bytes of their close-range jumps!..
     ldi r24, 1
     push r24
     ldi r24, 0
     push r24
-    rjmp _next
-
-_return_false:
-    ; return false from an instruction, i.e. push 0 onto stack and jump to
-    ; next instruction
-    ldi r24, 0
-    push r24
-    push r24
-    rjmp _next
+    NEXT
 
 ; NOTE: the binary logical operator implementations below were tested using
 ; the Python client as follows:
@@ -174,6 +281,16 @@ BUILTIN not
     breq _return_true   ; all bits were 0, i.e. it was false
     rjmp _return_false  ; at least one bit was 1, i.e. it was true
 
+_return_false:
+    ; return false from an instruction, i.e. push 0 onto stack and jump to
+    ; next instruction
+    ; NOTE: THIS LABEL NEEDS TO LIVE HERE, directly after all the comparison
+    ; operators, in order to be within 64 bytes of their RJMP instructions!..
+    ldi r24, 0
+    push r24
+    push r24
+    NEXT
+
 BUILTIN bitnot
     pop r25
     pop r24
@@ -181,7 +298,7 @@ BUILTIN bitnot
     com r25
     push r24
     push r25
-    rjmp _next
+    NEXT
 
 BUILTIN bitand
     _BINARYPOP
@@ -189,7 +306,7 @@ BUILTIN bitand
     and r25, r23
     push r24
     push r25
-    rjmp _next
+    NEXT
 
 BUILTIN bitor
     _BINARYPOP
@@ -197,7 +314,7 @@ BUILTIN bitor
     or r25, r23
     push r24
     push r25
-    rjmp _next
+    NEXT
 
 BUILTIN bitxor
     _BINARYPOP
@@ -205,7 +322,7 @@ BUILTIN bitxor
     eor r25, r23
     push r24
     push r25
-    rjmp _next
+    NEXT
 
 BUILTIN getptr
     pop r31    ; pop a pointer from the stack into Z
@@ -214,7 +331,7 @@ BUILTIN getptr
     ld r25, Z+ ; ...
     push r24   ; push the value onto stack
     push r25   ; ...
-    rjmp _next
+    NEXT
 
 BUILTIN getptrc
     pop r31    ; pop a pointer from the stack into Z
@@ -223,7 +340,7 @@ BUILTIN getptrc
     push r24   ; push the value onto stack
     ldi r24, 0 ; push 0 for the high byte
     push r24   ; ...
-    rjmp _next
+    NEXT
 
 BUILTIN setptr
     pop r31    ; pop a pointer from the stack into Z
@@ -232,7 +349,7 @@ BUILTIN setptr
     pop r24    ; ...
     st Z+, r24 ; store the value at the location pointed at by Z
     st Z+, r25 ; ...
-    rjmp _next
+    NEXT
 
 BUILTIN setptrc
     pop r31    ; pop a pointer from the stack into Z
@@ -242,7 +359,7 @@ BUILTIN setptrc
     pop r24    ; ...
     st Z+, r24 ; store the lower byte of the value at the location pointed
                ; at by Z
-    rjmp _next
+    NEXT
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -260,7 +377,7 @@ BUILTIN literal
     push r25
 
     ; jump to the next threaded code instruction
-    rjmp _next
+    NEXT
 
 BUILTIN store
     pop r25
@@ -270,7 +387,7 @@ BUILTIN store
     ld r31, Y+     ; ...
     st Z+, r24     ; store into the memory pointed to by Z
     st Z+, r25     ; ...
-    rjmp _next
+    NEXT
 
 BUILTIN load
     ld r30, Y+     ; load the argument following this instruction into Z
@@ -280,7 +397,7 @@ BUILTIN load
     ld r25, Z+     ; ...
     push r24
     push r25
-    rjmp _next
+    NEXT
 
 BUILTIN jump
     ; load the argument (which is a pointer to another instruction within
@@ -292,7 +409,7 @@ BUILTIN jump
     movw r28, r24
 
     ; jump to the indicated instruction within the threaded code
-    rjmp _next
+    NEXT
 
 BUILTIN jumpif
     pop r25
@@ -304,12 +421,12 @@ BUILTIN jumpif
         ld r24, Y+     ; load the argument
         ld r25, Y+     ; ...
         movw r28, r24  ; set Y to the argument
-        rjmp _next     ; jump to the argument
+        NEXT     ; jump to the argument
     _jumpif_false:
         ; TOS was 0
         adiw r28, 2  ; add 2 bytes, skipping over the argument so we point
                      ; at next instruction
-        rjmp _next   ; jump to next instruction
+        NEXT   ; jump to next instruction
 
 BUILTIN jumpifnot
     pop r25
@@ -322,13 +439,13 @@ BUILTIN atomic
     ; start an atomic "block" by disabling interrupts
     ; NOTE: THIS INSTRUCTION IS SUPER HACKY!..
     cli
-    rjmp _next
+    NEXT
 
 BUILTIN end_atomic
     ; end an atomic "block" by enabling interrupts
     ; NOTE: THIS INSTRUCTION IS SUPER HACKY!..
     sei
-    rjmp _next
+    NEXT
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -342,7 +459,7 @@ BUILTIN neg
     neg	r24 ; ...
     ldi r23, 0
     sbc	r25, r23
-    rjmp _next
+    NEXT
 
 BUILTIN dup
     ; TODO: see whether this can improved with LDS from stack pointer
@@ -352,7 +469,7 @@ BUILTIN dup
     push r25
     push r24
     push r25
-    rjmp _next
+    NEXT
 
 BUILTIN swap
     ; TODO: see whether this can improved with LDS from stack pointer
@@ -361,18 +478,18 @@ BUILTIN swap
     push r23 ; ...
     push r24 ; push x
     push r25 ; ...
-    rjmp _next
+    NEXT
 
 BUILTIN drop
     pop r25
     pop r24
-    rjmp _next
+    NEXT
 
 BUILTIN heap
     ; push X (address of top of heap) onto stack
     push r26
     push r27
-    rjmp _next
+    NEXT
 
 BUILTIN hpush
     ; pop a value from stack, push it onto the heap
@@ -380,14 +497,14 @@ BUILTIN hpush
     pop r24
     st X+, r24
     st X+, r25
-    rjmp _next
+    NEXT
 
 BUILTIN hpushc
     ; pop a value from stack, push its lower byte onto the heap
     pop r25
     pop r24
     st X+, r24
-    rjmp _next
+    NEXT
 
 BUILTIN assert
     pop r25
@@ -395,7 +512,7 @@ BUILTIN assert
     or r24, r25 ; we want to know if any of the bits are 1
     breq 1f     ; all bits were 0
         ; TOS was 1: assertion passed!
-        rjmp _next
+        NEXT
     1:
         ; TOS was 0: assertion failed!
         ; TODO: send a TASK_STOPPED message
@@ -411,13 +528,21 @@ BUILTIN set_led
     or r24, r25 ; we want to know if any of the bits are 1
     breq 1f     ; all bits were 0
         sbi	0x05, 5 ; turn LED on
-        rjmp _next
+        NEXT
     1:
         cbi	0x05, 5 ; turn LED off
-        rjmp _next
+        NEXT
 
 BUILTIN sleep
-    rjmp builtin_halt
+    ; poor man's sleep: just churn CPU for a while...
+    ; we could be fancy and convert from ms to cycles, but... we don't
+    pop r25
+    pop r24
+    1:
+        sbiw r24, 1
+        brne 1b       ; loop until we hit 0
+    NEXT
+
 BUILTIN getc
     rjmp builtin_halt
 BUILTIN putc

@@ -5,6 +5,9 @@
 // tasklang.S stores stack pointer in here so we can examine it
 uint16_t _sp = 0;
 
+// TIMER0_OVF_vect increments this
+uint16_t _tick = 0;
+
 #define __ALWAYS_INLINE__ inline __attribute__((always_inline))
 
 
@@ -25,6 +28,19 @@ static __ALWAYS_INLINE__ uint16_t get_heap_size(task_t *task) {
     return (task->free - task->mem) - task->code_size;
 }
 
+void init_task(task_t *task) {
+    char *code = task->mem;
+    char *heap = task->free;
+
+    // stack pointer should point at last byte of task's memory
+    char *stack = task->mem + TASK_MEM_SIZE - 1;
+    task->stack = stack;
+
+    // implemented in assembly, pushes registers onto task's stack to be
+    // picked up next time there's a context switch to it
+    _init_task(code, heap, stack);
+}
+
 void start_task(task_t *task) {
     task->state = TASK_STATE_STARTED;
 }
@@ -32,6 +48,28 @@ void start_task(task_t *task) {
 void stop_task(task_t *task) {
     task->state = TASK_STATE_STOPPED;
     // TODO...
+}
+
+void __attribute__((noreturn)) switch_task(char *old_stack, char *old_free) {
+
+    // Update old task
+    task_t *old_task = &TASKS[current_task_id];
+    old_task->stack = old_stack;
+    old_task->free = old_free;
+
+    // Choose next task to run a time slice of
+    task_id_t task_id = current_task_id + 1;
+    if (task_id >= MAX_TASKS) task_id = 0;
+    current_task_id = task_id;
+    task_t *task = &TASKS[task_id];
+
+    if (task->state == TASK_STATE_STARTED) {
+        resume_task(task->stack); // ...and we will never return...
+    } else {
+        // Task isn't ready to run, so just sleep until the next time slice...
+        sei(); // enable global interrupts
+        for (;;) sleep_mode();
+    }
 }
 
 
@@ -78,6 +116,14 @@ static __ALWAYS_INLINE__ void uart_put_uint16(uint16_t i) {
     // NOTE: little-endian
     uart_put(i & 0xff);
     uart_put(i >> 8);
+}
+
+static __ALWAYS_INLINE__ void uart_put_uint32(uint32_t i) {
+    // NOTE: little-endian
+    uart_put(i & 0xff);
+    uart_put((i >> 8) & 0xff);
+    uart_put((i >> 16) & 0xff);
+    uart_put(i >> 24);
 }
 
 static __ALWAYS_INLINE__ char to_hex(uint8_t c) {
@@ -130,6 +176,40 @@ static __ALWAYS_INLINE__ void led_toggle(void) {
 
 
 ///////////////////////////////////////////////////////////////////////////////
+// TIMER FUNCTIONS
+
+void timer_init(void) {
+
+    // https://ww1.microchip.com/downloads/en/DeviceDoc/Atmel-7810-Automotive-Microcontrollers-ATmega328P_Datasheet.pdf
+    /*
+        14.7.2 Clear Timer on Compare Match (CTC) Mode
+        In clear timer on compare or CTC mode (WGM02:0 = 2), the OCR0A
+        register is used to manipulate the counter resolution.
+        In CTC mode the counter is cleared to zero when the counter value
+        (TCNT0) matches the OCR0A.
+    */
+
+    // TCCB = Timer/Counter Control Register
+    // CS = Clock Source (just CS00: no prescaling)
+    // WGM = Wave Generation Mode (just WGM01: CTC mode, i.e. Clear Timer on
+    // Compare)
+    TCCR0A = (1 << CS00) | (1 << WGM01);
+
+    // TIFR = Timer Interrupt Flag Register
+    // OCF0A = Output Compare Flag
+    // NOTE: writing 1 to an interrupt flag *clears it*, weird
+    TIFR0 = 1 << OCF0A;
+
+    // TIMSK = Timer Interrupt Mask Register
+    // OCIE = Output Compare Interrupt Enable
+    TIMSK0 = 1 << OCIE0A;
+
+    // OCR = Output Compare Register
+    OCR0A = CYCLES_PER_TICK;
+}
+
+
+///////////////////////////////////////////////////////////////////////////////
 // OS/CLIENT MESSAGES
 
 static __ALWAYS_INLINE__ task_id_t get_task_id(void) {
@@ -155,6 +235,9 @@ static __ALWAYS_INLINE__ void handle_get_offsets(void) {
     uart_put_uint16(MAX_TASKS);
     uart_put_uint16(TASK_SIZE);
     uart_put_uint16(offsetof(task_t, mem));
+
+    uart_put_uint32(TICKS_PER_SECOND);
+    uart_put_uint16(CYCLES_PER_TICK);
 }
 
 static __ALWAYS_INLINE__ void handle_get_builtin_locations(void) {
@@ -178,6 +261,7 @@ static __ALWAYS_INLINE__ void handle_load_task(void) {
     while (data < data_end) *data++ = uart_get();
     data_end += TASK_MEM_SIZE - data_size;
     while (data < data_end) *data++ = '\0';
+    init_task(task);
 }
 
 static __ALWAYS_INLINE__ void handle_start_task(void) {
@@ -214,6 +298,10 @@ static __ALWAYS_INLINE__ void handle_set_memory(void) {
     while (p < end) *p++ = uart_get();
 }
 
+static __ALWAYS_INLINE__ void handle_get_timer(void) {
+    uart_put_uint16(_tick);
+}
+
 static __ALWAYS_INLINE__ void handle_message(char msg_type) {
     switch (msg_type) {
         case MESSAGE_PING: handle_ping(); break;
@@ -225,6 +313,7 @@ static __ALWAYS_INLINE__ void handle_message(char msg_type) {
         case MESSAGE_INSPECT_TASK: handle_inspect_task(); break;
         case MESSAGE_GET_MEMORY: handle_get_memory(); break;
         case MESSAGE_SET_MEMORY: handle_set_memory(); break;
+        case MESSAGE_GET_TIMER: handle_get_timer(); break;
         default: die("Bad input message type");
     }
 }
@@ -265,6 +354,8 @@ void send_task_stopped(task_id_t task_id, char reason) {
 // memory we need to allocate for each task (i.e. the bigger TASK_SIZE must
 // be), which decreases the maximum number of tasks we can have (i.e.
 // MAX_TASKS).
+// NOTE: marking the individual functions __ALWAYS_INLINE__ is probably
+// equivalent to just passing ISR_FLATTEN to ISR()...
 //
 // A different (better?..) way to handle all this might be to allocate a
 // separate stack space for interrupts to use, and have all interrupts begin
@@ -292,14 +383,18 @@ ISR (USART_RX_vect) {
     uart_put_newline();
 }
 
-/*
-ISR (USART0_UDRE_vect) {
-    // USART is ready for more input
+ISR (TIMER0_COMPA_vect, ISR_NAKED) {
+    // The timer interrupt, represents a "tick", runs every CYCLES_PER_TICK
+    // cycles
+    _tick++;
 
-    // TODO: implement stdout queue
-    UDR0 = ...;
+    if (!(_tick & 0xff)) led_toggle();
+    sei();
+    for (;;) ;
+
+    // Initiates a context switch, doesn't return.
+    pause_task();
 }
-*/
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -333,34 +428,12 @@ void __attribute__((noreturn)) blink_forever(void) {
     }
 }
 
-void __attribute__((noreturn)) mainloop(void) {
-    while (1) {
-        for (task_id_t task_id = 0; task_id < MAX_TASKS; task_id++) {
-            task_t *task = &TASKS[task_id];
-
-            // Flash slowly as we check for tasks
-            led_toggle();
-            _delay_ms(200);
-
-            // Get task's state, which is an atomic operation since the
-            // state is a uint8_t
-            if (task->state == TASK_STATE_STARTED) {
-                // NOTE: these task field accesses are not atomic, so
-                // hopefully no interrupt is concurrently messing with them...
-                char *code = task->mem;
-                char *heap = task->free;
-                char *stack = task->mem + TASK_MEM_SIZE - 1; // stack pointer should point at last byte of task's memory
-                current_task_id = 0;
-                run_task_immediate(code, heap, stack); // ...and we will never return...
-            }
-        }
-    }
-}
-
 int main(void) {
     led_init();
     uart_init();
+    timer_init();
     tasks_init();
+    set_sleep_mode(SLEEP_MODE_IDLE);
 
     // Indicate that we've started, by flashing the LED a few times!
     for (uint8_t i = 8; i--;) {
@@ -369,6 +442,6 @@ int main(void) {
     }
 
     sei(); // enable global interrupts
-    mainloop(); // wait forever for runnable tasks
+    for (;;) ; // churn a bit until the timer interrupt fires... we will never return!
     return 0;
 }

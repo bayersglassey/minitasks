@@ -14,15 +14,15 @@ from miniserial import Serial
 from tasklang import BUILTINS, Compilation, compile
 
 
-def encode_uint16(i) -> bytes:
+def encode_uint(i) -> bytes:
     return i.to_bytes(2, 'little')
-def decode_uint16(data: bytes) -> int:
+def decode_uint(data: bytes) -> int:
     return int.from_bytes(data, 'little')
 
 def parse_ints(data: bytes) -> List[int]:
     values = []
     for i in range(0, len(data), 2):
-        values.append(decode_uint16(data[i:i+2]))
+        values.append(decode_uint(data[i:i+2]))
     return values
 
 
@@ -39,6 +39,7 @@ MESSAGE_TASK_LOG               = b'\x08'
 MESSAGE_TASK_STOPPED           = b'\x09'
 MESSAGE_GET_MEMORY             = b'\x0a'
 MESSAGE_SET_MEMORY             = b'\x0b'
+MESSAGE_GET_TIMER              = b'\x0c'
 
 
 class Offsets(NamedTuple):
@@ -48,6 +49,8 @@ class Offsets(NamedTuple):
     max_tasks: int # MAX_TASKS in minitasks.h
     task_size: int # TASK_SIZE in minitasks.h, i.e. sizeof(task_t)
     task_mem_offset: int # offset of task_t's mem field
+    ticks_per_second: int # TICKS_PER_SECOND in minitasks.h
+    cycles_per_tick: int # CYCLES_PER_TICK in minitasks.h
 
     @property
     def ram_size(self) -> int:
@@ -65,6 +68,36 @@ class Offsets(NamedTuple):
 
     def get_task_loc(self, task_id: int) -> int:
         return self.tasks_table_location + self.task_size * task_id
+
+
+class TimerInfo(NamedTuple):
+    TCNT0: int
+
+    # TCCB = Timer/Counter Control Register, CS = Clock Select
+    # CS02:00 are used to choose clock source; if only CS02 is set, we're
+    # using system clock / 256.
+    TCCR0B: int
+    CS02: int
+
+    # TIFR = Timer Interrupt Flag Register, TOV = Timer/Counter Overflow Flag
+    # We're... setting the overflow flag?.. nope, writing 1 to an interrupt
+    # flag on the AVR actually clears it! O_o
+    TIFR0: int
+    TOV0: int
+
+    # TIMSK = Timer Interrupt Mask Register, TOIE = Timer/Counter Overflow Interrupt Enable
+    # We're enabling the interrupt!
+    TIMSK0: int
+    TOIE0: int
+
+
+    # uint16_t, incremented 256 times per second
+    tick: int
+
+    @property
+    def tick_s(self) -> float:
+        """Counts upwards in seconds"""
+        return self.tick / self.ticks_per_second
 
 
 class Memory(NamedTuple):
@@ -161,11 +194,14 @@ class Client:
         for attr in cached_attrs:
             self.__dict__.pop(attr, None)
 
+    def read_uint8(self) -> int:
+        return int.from_bytes(self.read(1))
+
     def read_uint16(self) -> int:
-        return decode_uint16(self.read(2))
+        return decode_uint(self.read(2))
 
     def write_uint16(self, i: int):
-        self.write(encode_uint16(i))
+        self.write(encode_uint(i))
 
     def send_bytes(self, data: bytes):
         self.write_uint16(len(data))
@@ -184,14 +220,16 @@ class Client:
 
     def get_offsets(self) -> Offsets:
         self.write(b'\xff' + MESSAGE_GET_OFFSETS)
-        data = self.read(12)
+        data = self.read(18)
         return Offsets(
-            decode_uint16(data[0:2]),
-            decode_uint16(data[2:4]),
-            decode_uint16(data[4:6]),
-            decode_uint16(data[6:8]),
-            decode_uint16(data[8:10]),
-            decode_uint16(data[10:12]),
+            decode_uint(data[0:2]),
+            decode_uint(data[2:4]),
+            decode_uint(data[4:6]),
+            decode_uint(data[6:8]),
+            decode_uint(data[8:10]),
+            decode_uint(data[10:12]),
+            decode_uint(data[12:16]), # 32 bits!
+            decode_uint(data[16:18]),
         )
 
     offsets = cached_property(get_offsets)
@@ -235,7 +273,7 @@ class Client:
         for i in comp.builtin_locations:
             instructions[i] = builtin_locations[instructions[i]]
         for instruction in instructions:
-            buf.extend(encode_uint16(instruction))
+            buf.extend(encode_uint(instruction))
         code = bytes(buf)
 
         return TaskMemory(
@@ -324,7 +362,7 @@ class Client:
         self.write_uint16(size)
         data = self.read(size)
         if type == 'i':
-            return decode_uint16(data)
+            return decode_uint(data)
         elif type == 'ii':
             return parse_ints(data)
         else:
@@ -332,17 +370,23 @@ class Client:
 
     def set_memory(self, loc: int, data: bytes):
         if isinstance(data, int):
-            data = encode_uint16(data)
+            data = encode_uint(data)
         elif isinstance(data, (list, tuple)):
             buf = bytearray()
             for d in data:
                 if isinstance(d, int):
-                    d = encode_uint16(d)
+                    d = encode_uint(d)
                 buf.extend(d)
             data = bytes(buf)
         self.write(b'\xff' + MESSAGE_SET_MEMORY)
         self.write_uint16(loc)
         self.send_bytes(data)
+
+    def get_timer(self) -> TimerInfo:
+        self.write(b'\xff' + MESSAGE_GET_TIMER)
+        return TimerInfo(
+            self.read_uint16(),
+        )
 
 
 def main():
