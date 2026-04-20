@@ -323,7 +323,7 @@ def compile(parsed) -> Compilation:
         010: _jumpif
         011: 14
         012: _jump
-        013: 32
+        013: 34
         014: _atomic
         015: _literal
         016: 2
