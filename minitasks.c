@@ -42,18 +42,27 @@ void init_task(task_t *task) {
 }
 
 void start_task(task_t *task) {
-    task->state = TASK_STATE_STARTED;
+    if (task->state == TASK_STATE_STOPPED) {
+        task->state = TASK_STATE_READY;
+    }
 }
 
 void stop_task(task_t *task) {
+    // TODO: if we add more states, like WAITING, then setting directly to
+    // STOPPED might mess things up, because it would allow start_task to
+    // set to READY, which would allow context switch to set to RUNNING,
+    // which might mess up if the code was expecting something to be pushed
+    // onto stack!..
     task->state = TASK_STATE_STOPPED;
-    // TODO...
 }
 
 void __attribute__((noreturn)) switch_task(char *old_stack, char *old_free) {
 
     // Update old task
     task_t *old_task = &TASKS[current_task_id];
+    if (old_task->state == TASK_STATE_RUNNING) {
+        old_task->state = TASK_STATE_READY;
+    }
     old_task->stack = old_stack;
     old_task->free = old_free;
 
@@ -63,7 +72,8 @@ void __attribute__((noreturn)) switch_task(char *old_stack, char *old_free) {
     current_task_id = task_id;
     task_t *task = &TASKS[task_id];
 
-    if (task->state == TASK_STATE_STARTED) {
+    if (task->state == TASK_STATE_READY) {
+        task->state = TASK_STATE_RUNNING;
         resume_task(task->stack); // ...and we will never return...
     } else {
         // Task isn't ready to run, so just sleep until the next time slice...
@@ -388,7 +398,9 @@ ISR (TIMER0_COMPA_vect, ISR_NAKED) {
     // cycles
     _tick++;
 
-    if (!(_tick & 0xff)) led_toggle();
+    // DEBUGGING PURPOSES: flash the LED so we can tell that this interrupt
+    // is working...
+    if (_tick == 0) led_toggle();
     sei();
     for (;;) ;
 

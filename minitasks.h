@@ -41,9 +41,8 @@ typedef uint8_t task_id_t;
 typedef uint8_t task_state_t;
 enum task_state {
     TASK_STATE_STOPPED   = 0,
-    TASK_STATE_STARTED   = 1,
-    TASK_STATE_SLEEPING  = 2,
-    TASK_STATE_QUEUED    = 3,
+    TASK_STATE_READY     = 1,
+    TASK_STATE_RUNNING   = 2,
 };
 
 enum message_type {
